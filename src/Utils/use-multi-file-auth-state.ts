@@ -29,7 +29,7 @@ export const useMultiFileAuthState = async(folder: string): Promise<{ state: Aut
 
 	const removeData = async(file: string) => {
 		try {
-			await unlink(join(folder, fixFileName(file)!))
+			await unlink(fixFileName(file)!)
 		} catch{
 
 		}

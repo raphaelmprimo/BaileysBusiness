@@ -1,11 +1,9 @@
-import { AxiosRequestConfig } from 'axios'
+import type NodeCache from 'node-cache'
 import type { Logger } from 'pino'
 import type { Readable } from 'stream'
 import type { URL } from 'url'
 import { proto } from '../../WAProto'
-import { MEDIA_HKDF_KEY_MAPPING } from '../Defaults'
 import type { GroupMetadata } from './GroupMetadata'
-import { CacheStore } from './Socket'
 
 // export the WAMessage Prototypes
 export { proto as WAProto }
@@ -18,9 +16,9 @@ export type WATextMessage = proto.Message.IExtendedTextMessage
 export type WAContextInfo = proto.IContextInfo
 export type WALocationMessage = proto.Message.ILocationMessage
 export type WAGenericMediaMessage = proto.Message.IVideoMessage | proto.Message.IImageMessage | proto.Message.IAudioMessage | proto.Message.IDocumentMessage | proto.Message.IStickerMessage
-// eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars
+// eslint-disable-next-line no-unused-vars
 export import WAMessageStubType = proto.WebMessageInfo.StubType
-// eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars
+// eslint-disable-next-line no-unused-vars
 export import WAMessageStatus = proto.WebMessageInfo.Status
 export type WAMediaUpload = Buffer | { url: URL | string } | { stream: Readable }
 /** Set of message types that are supported by the library */
@@ -43,8 +41,6 @@ export interface WAUrlInfo {
     title: string
     description?: string
     jpegThumbnail?: Buffer
-    highQualityThumbnail?: proto.Message.IImageMessage
-    originalThumbnailUrl?: string
 }
 
 // types to generate WA messages
@@ -79,16 +75,7 @@ type WithDimensions = {
     width?: number
     height?: number
 }
-
-export type PollMessageOptions = {
-    name: string
-    selectableCount?: number
-    values: string[]
-    /** 32 byte message secret to encrypt poll selections */
-    messageSecret?: Uint8Array
-}
-
-export type MediaType = keyof typeof MEDIA_HKDF_KEY_MAPPING
+export type MediaType = 'image' | 'video' | 'sticker' | 'audio' | 'document' | 'history' | 'md-app-state'
 export type AnyMediaMessageContent = (
     ({
         image: WAMediaUpload
@@ -115,7 +102,6 @@ export type AnyMediaMessageContent = (
         document: WAMediaUpload
         mimetype: string
         fileName?: string
-        caption?: string
     } & Buttonable & Templatable))
     & { mimetype?: string }
 
@@ -136,9 +122,6 @@ export type AnyRegularMessageContent = (
     }
     & Mentionable & Buttonable & Templatable & Listable)
     | AnyMediaMessageContent
-    | ({
-        poll: PollMessageOptions
-    } & Mentionable & Buttonable & Templatable)
     | {
         contacts: {
             displayName?: string
@@ -154,10 +137,7 @@ export type AnyRegularMessageContent = (
         type: 'template' | 'plain'
     }
     | {
-        listReply: Omit<proto.Message.IListResponseMessage, 'contextInfo'>
-    }
-    | {
-        product: WASendableProduct
+        product: WASendableProduct,
         businessOwnerJid?: string
         body?: string
         footer?: string
@@ -210,14 +190,11 @@ export type WAMediaUploadFunction = (readStream: Readable, opts: { fileEncSha256
 
 export type MediaGenerationOptions = {
 	logger?: Logger
-    mediaTypeOverride?: MediaType
     upload: WAMediaUploadFunction
     /** cache media so it does not have to be uploaded again */
-    mediaCache?: CacheStore
+    mediaCache?: NodeCache
 
     mediaUploadTimeoutMs?: number
-
-    options?: AxiosRequestConfig
 }
 export type MessageContentGenerationOptions = MediaGenerationOptions & {
 	getUrlInfo?: (text: string) => Promise<WAUrlInfo | undefined>

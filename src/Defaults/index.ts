@@ -1,6 +1,4 @@
-import { proto } from '../../WAProto'
-import { makeLibSignalRepository } from '../Signal/libsignal'
-import type { AuthenticationState, MediaType, SocketConfig, WAVersion } from '../Types'
+import type { CommonSocketConfig, LegacySocketConfig, MediaType, SocketConfig } from '../Types'
 import { Browsers } from '../Utils'
 import logger from '../Utils/logger'
 import { version } from './baileys-version.json'
@@ -21,23 +19,17 @@ export const NOISE_WA_HEADER = Buffer.from(
 	[ 87, 65, 6, DICT_VERSION ]
 ) // last is "DICT_VERSION"
 /** from: https://stackoverflow.com/questions/3809401/what-is-a-good-regular-expression-to-match-a-url */
-export const URL_REGEX = /(http(s)?:\/\/.)?(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_\+.~#?&//=]*)/
+export const URL_REGEX = /[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_+.~#?&//=]*)?/gi
 export const URL_EXCLUDE_REGEX = /.*@.*/
 
 export const WA_CERT_DETAILS = {
 	SERIAL: 0,
 }
 
-export const PROCESSABLE_HISTORY_TYPES = [
-	proto.Message.HistorySyncNotification.HistorySyncType.INITIAL_BOOTSTRAP,
-	proto.Message.HistorySyncNotification.HistorySyncType.PUSH_NAME,
-	proto.Message.HistorySyncNotification.HistorySyncType.RECENT,
-	proto.Message.HistorySyncNotification.HistorySyncType.FULL
-]
-
-export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
-	version: version as WAVersion,
+const BASE_CONNECTION_CONFIG: CommonSocketConfig = {
+	version: version as any,
 	browser: Browsers.baileys('Chrome'),
+
 	waWebSocketUrl: 'wss://web.whatsapp.com/ws/chat',
 	connectTimeoutMs: 20_000,
 	keepAliveIntervalMs: 15_000,
@@ -46,55 +38,36 @@ export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
 	emitOwnEvents: true,
 	defaultQueryTimeoutMs: 60_000,
 	customUploadHosts: [],
-	retryRequestDelayMs: 250,
-	fireInitQueries: true,
-	auth: undefined as unknown as AuthenticationState,
-	markOnlineOnConnect: true,
-	syncFullHistory: false,
-	patchMessageBeforeSending: msg => msg,
-	shouldSyncHistoryMessage: () => true,
-	shouldIgnoreJid: () => false,
-	linkPreviewImageThumbnailWidth: 192,
-	transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
-	generateHighQualityLinkPreview: false,
-	options: { },
-	appStateMacVerification: {
-		patch: false,
-		snapshot: false,
-	},
-	getMessage: async() => undefined,
-	makeSignalRepository: makeLibSignalRepository
+	retryRequestDelayMs: 250
 }
 
-export const MEDIA_PATH_MAP: { [T in MediaType]?: string } = {
+export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
+	...BASE_CONNECTION_CONFIG,
+	fireInitQueries: true,
+	auth: undefined as any,
+	downloadHistory: true,
+	markOnlineOnConnect: true,
+	syncFullHistory: false,
+	linkPreviewImageThumbnailWidth: 192,
+	transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
+	getMessage: async() => undefined
+}
+
+export const DEFAULT_LEGACY_CONNECTION_CONFIG: LegacySocketConfig = {
+	...BASE_CONNECTION_CONFIG,
+	waWebSocketUrl: 'wss://web.whatsapp.com/ws',
+	phoneResponseTimeMs: 20_000,
+	expectResponseTimeout: 60_000,
+}
+
+export const MEDIA_PATH_MAP: { [T in MediaType]: string } = {
 	image: '/mms/image',
 	video: '/mms/video',
 	document: '/mms/document',
 	audio: '/mms/audio',
 	sticker: '/mms/image',
-	'thumbnail-link': '/mms/image',
-	'product-catalog-image': '/product/image',
+	history: '',
 	'md-app-state': ''
-}
-
-export const MEDIA_HKDF_KEY_MAPPING = {
-	'audio': 'Audio',
-	'document': 'Document',
-	'gif': 'Video',
-	'image': 'Image',
-	'ppic': '',
-	'product': 'Image',
-	'ptt': 'Audio',
-	'sticker': 'Image',
-	'video': 'Video',
-	'thumbnail-document': 'Document Thumbnail',
-	'thumbnail-image': 'Image Thumbnail',
-	'thumbnail-video': 'Video Thumbnail',
-	'thumbnail-link': 'Link Thumbnail',
-	'md-msg-hist': 'History',
-	'md-app-state': 'App State',
-	'product-catalog-image': '',
-	'payment-bg-image': 'Payment Background',
 }
 
 export const MEDIA_KEYS = Object.keys(MEDIA_PATH_MAP) as MediaType[]
@@ -102,10 +75,3 @@ export const MEDIA_KEYS = Object.keys(MEDIA_PATH_MAP) as MediaType[]
 export const MIN_PREKEY_COUNT = 5
 
 export const INITIAL_PREKEY_COUNT = 30
-
-export const DEFAULT_CACHE_TTLS = {
-	SIGNAL_STORE: 5 * 60, // 5 minutes
-	MSG_RETRY: 60 * 60, // 1 hour
-	CALL_OFFER: 5 * 60, // 5 minutes
-	USER_DEVICES: 5 * 60, // 5 minutes
-}

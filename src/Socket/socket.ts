@@ -27,19 +27,15 @@ export const makeSocket = ({
 	defaultQueryTimeoutMs,
 	syncFullHistory,
 	transactionOpts,
-	qrTimeout,
-	options,
-	makeSignalRepository
+	qrTimeout
 }: SocketConfig) => {
 	const ws = new WebSocket(waWebSocketUrl, undefined, {
 		origin: DEFAULT_ORIGIN,
-		headers: options.headers as {},
 		handshakeTimeout: connectTimeoutMs,
 		timeout: connectTimeoutMs,
 		agent
 	})
 	ws.setMaxListeners(0)
-
 	const ev = makeEventBuffer(logger)
 	/** ephemeral key pair used to encrypt/decrypt communication. Unique for each connection */
 	const ephemeralKeyPair = Curve.generateKeyPair()
@@ -49,7 +45,6 @@ export const makeSocket = ({
 	const { creds } = authState
 	// add transaction capability
 	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
-	const signalRepository = makeSignalRepository({ creds, keys })
 
 	let lastDateRecv: Date
 	let epoch = 1
@@ -68,17 +63,7 @@ export const makeSocket = ({
 		}
 
 		const bytes = noise.encodeFrame(data)
-		await promiseTimeout<void>(
-			connectTimeoutMs,
-			async(resolve, reject) => {
-				try {
-					await sendPromise.call(ws, bytes)
-					resolve()
-				} catch(error) {
-					reject(error)
-				}
-			}
-		)
+        await sendPromise.call(ws, bytes) as Promise<void>
 	}
 
 	/** send a binary node */
@@ -92,27 +77,25 @@ export const makeSocket = ({
 	}
 
 	/** log & process any unexpected errors */
-	const onUnexpectedError = (err: Error | Boom, msg: string) => {
+	const onUnexpectedError = (error: Error, msg: string) => {
 		logger.error(
-			{ err },
+			{ trace: error.stack, output: (error as any).output },
 			`unexpected error in '${msg}'`
 		)
 	}
 
 	/** await the next incoming message */
-	const awaitNextMessage = async<T>(sendMsg?: Uint8Array) => {
+	const awaitNextMessage = async(sendMsg?: Uint8Array) => {
 		if(ws.readyState !== ws.OPEN) {
-			throw new Boom('Connection Closed', {
-				statusCode: DisconnectReason.connectionClosed
-			})
+			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
 		}
 
-		let onOpen: (data: T) => void
+		let onOpen: (data: any) => void
 		let onClose: (err: Error) => void
 
-		const result = promiseTimeout<T>(connectTimeoutMs, (resolve, reject) => {
-			onOpen = resolve
-			onClose = mapWebSocketError(reject)
+		const result = promiseTimeout<any>(connectTimeoutMs, (resolve, reject) => {
+			onOpen = (data: any) => resolve(data)
+			onClose = reject
 			ws.on('frame', onOpen)
 			ws.on('close', onClose)
 			ws.on('error', onClose)
@@ -136,11 +119,11 @@ export const makeSocket = ({
      * @param json query that was sent
      * @param timeoutMs timeout after which the promise will reject
      */
-	 const waitForMessage = async<T>(msgId: string, timeoutMs = defaultQueryTimeoutMs) => {
+	 const waitForMessage = async(msgId: string, timeoutMs = defaultQueryTimeoutMs) => {
 		let onRecv: (json) => void
 		let onErr: (err) => void
 		try {
-			const result = await promiseTimeout<T>(timeoutMs,
+			const result = await promiseTimeout(timeoutMs,
 				(resolve, reject) => {
 					onRecv = resolve
 					onErr = err => {
@@ -152,7 +135,7 @@ export const makeSocket = ({
 					ws.off('error', onErr)
 				},
 			)
-			return result
+			return result as any
 		} finally {
 			ws.off(`TAG:${msgId}`, onRecv!)
 			ws.off('close', onErr!) // if the socket closes, you'll never receive the message
@@ -190,7 +173,7 @@ export const makeSocket = ({
 
 		const init = proto.HandshakeMessage.encode(helloMsg).finish()
 
-		const result = await awaitNextMessage<Uint8Array>(init)
+		const result = await awaitNextMessage(init)
 		const handshake = proto.HandshakeMessage.decode(result)
 
 		logger.trace({ handshake }, 'handshake recv from WA Web')
@@ -350,7 +333,7 @@ export const makeSocket = ({
 		let onClose: (err: Error) => void
 		await new Promise((resolve, reject) => {
 			onOpen = () => resolve(undefined)
-			onClose = mapWebSocketError(reject)
+			onClose = reject
 			ws.on('open', onOpen)
 			ws.on('close', onClose)
 			ws.on('error', onClose)
@@ -413,7 +396,7 @@ export const makeSocket = ({
 	)
 
 	/** logout & invalidate connection */
-	const logout = async(msg?: string) => {
+	const logout = async() => {
 		const jid = authState.creds.me?.id
 		if(jid) {
 			await sendNode({
@@ -436,19 +419,17 @@ export const makeSocket = ({
 			})
 		}
 
-		end(new Boom(msg || 'Intentional Logout', { statusCode: DisconnectReason.loggedOut }))
+		end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }))
 	}
 
 	ws.on('message', onMessageRecieved)
-	ws.on('open', async() => {
-		try {
-			await validateConnection()
-		} catch(err) {
-			logger.error({ err }, 'error in validating connection')
-			end(err)
-		}
-	})
-	ws.on('error', mapWebSocketError(end))
+	ws.on('open', validateConnection)
+	ws.on('error', error => end(
+		new Boom(
+			`WebSocket Error (${error.message})`,
+			{ statusCode: getCodeFromWSError(error), data: error }
+		)
+	))
 	ws.on('close', () => end(new Boom('Connection Terminated', { statusCode: DisconnectReason.connectionClosed })))
 	// the server terminated the connection
 	ws.on('CB:xmlstreamend', () => end(new Boom('Connection Terminated by Server', { statusCode: DisconnectReason.connectionClosed })))
@@ -542,38 +523,17 @@ export const makeSocket = ({
 		end(new Boom('Multi-device beta not joined', { statusCode: DisconnectReason.multideviceMismatch }))
 	})
 
-	let didStartBuffer = false
 	process.nextTick(() => {
-		if(creds.me?.id) {
-			// start buffering important events
-			// if we're logged in
-			ev.buffer()
-			didStartBuffer = true
-		}
-
+		// start buffering important events
+		ev.buffer()
 		ev.emit('connection.update', { connection: 'connecting', receivedPendingNotifications: false, qr: undefined })
 	})
-
-	// called when all offline notifs are handled
-	ws.on('CB:ib,,offline', (node: BinaryNode) => {
-		const child = getBinaryNodeChild(node, 'offline')
-		const offlineNotifs = +(child?.attrs.count || 0)
-
-		logger.info(`handled ${offlineNotifs} offline messages/notifications`)
-		if(didStartBuffer) {
-			ev.flush()
-			logger.trace('flushed events for initial buffer')
-		}
-
-		ev.emit('connection.update', { receivedPendingNotifications: true })
-	})
-
 	// update credentials when required
 	ev.on('creds.update', update => {
 		const name = update.me?.name
 		// if name has just been received
 		if(creds.me?.name !== name) {
-			logger.debug({ name }, 'updated pushName')
+			logger.info({ name }, 'updated pushName')
 			sendNode({
 				tag: 'presence',
 				attrs: { name: name! }
@@ -595,7 +555,6 @@ export const makeSocket = ({
 		ws,
 		ev,
 		authState: { creds, keys },
-		signalRepository,
 		get user() {
 			return authState.creds.me
 		},
@@ -609,24 +568,8 @@ export const makeSocket = ({
 		end,
 		onUnexpectedError,
 		uploadPreKeys,
-		uploadPreKeysToServerIfRequired,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
-	}
-}
-
-/**
- * map the websocket error to the right type
- * so it can be retried by the caller
- * */
-function mapWebSocketError(handler: (err: Error) => void) {
-	return (error: Error) => {
-		handler(
-			new Boom(
-				`WebSocket Error (${error.message})`,
-				{ statusCode: getCodeFromWSError(error), data: error }
-			)
-		)
 	}
 }
 

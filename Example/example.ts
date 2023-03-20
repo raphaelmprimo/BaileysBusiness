@@ -1,6 +1,5 @@
 import { Boom } from '@hapi/boom'
-import NodeCache from 'node-cache'
-import makeWASocket, { AnyMessageContent, delay, DisconnectReason, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, makeCacheableSignalKeyStore, makeInMemoryStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
+import makeWASocket, { AnyMessageContent, delay, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore, MessageRetryMap, useMultiFileAuthState } from '../src'
 import MAIN_LOGGER from '../src/Utils/logger'
 
 const logger = MAIN_LOGGER.child({ })
@@ -11,7 +10,7 @@ const doReplies = !process.argv.includes('--no-reply')
 
 // external map to store retry counts of messages when decryption/encryption fails
 // keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
-const msgRetryCounterCache = new NodeCache()
+const msgRetryCounterMap: MessageRetryMap = { }
 
 // the store maintains the data of the WA connection in memory
 // can be written out to a file & read from it
@@ -33,18 +32,20 @@ const startSock = async() => {
 		version,
 		logger,
 		printQRInTerminal: true,
-		auth: {
-			creds: state.creds,
-			/** caching makes the store faster to send/recv messages */
-			keys: makeCacheableSignalKeyStore(state.keys, logger),
-		},
-		msgRetryCounterCache,
-		generateHighQualityLinkPreview: true,
-		// ignore all broadcast messages -- to receive the same
-		// comment the line below out
-		// shouldIgnoreJid: jid => isJidBroadcast(jid),
-		// implement to handle retries & poll updates
-		getMessage,
+		auth: state,
+		msgRetryCounterMap,
+		// implement to handle retries
+		getMessage: async key => {
+			if(store) {
+				const msg = await store.loadMessage(key.remoteJid!, key.id!, undefined)
+				return msg?.message || undefined
+			}
+
+			// only if store is present
+			return {
+				conversation: 'hello'
+			}
+		}
 	})
 
 	store?.bind(sock.ev)
@@ -92,10 +93,21 @@ const startSock = async() => {
 				console.log('recv call event', events.call)
 			}
 
-			// history received
-			if(events['messaging-history.set']) {
-				const { chats, contacts, messages, isLatest } = events['messaging-history.set']
-				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`)
+			// chat history received
+			if(events['chats.set']) {
+				const { chats, isLatest } = events['chats.set']
+				console.log(`recv ${chats.length} chats (is latest: ${isLatest})`)
+			}
+
+			// message history received
+			if(events['messages.set']) {
+				const { messages, isLatest } = events['messages.set']
+				console.log(`recv ${messages.length} messages (is latest: ${isLatest})`)
+			}
+
+			if(events['contacts.set']) {
+				const { contacts, isLatest } = events['contacts.set']
+				console.log(`recv ${contacts.length} contacts (is latest: ${isLatest})`)
 			}
 
 			// received a new message
@@ -116,24 +128,7 @@ const startSock = async() => {
 
 			// messages updated like status delivered, message deleted etc.
 			if(events['messages.update']) {
-				console.log(
-					JSON.stringify(events['messages.update'], undefined, 2)
-				)
-
-				for(const { key, update } of events['messages.update']) {
-					if(update.pollUpdates) {
-						const pollCreation = await getMessage(key)
-						if(pollCreation) {
-							console.log(
-								'got poll update, aggregation: ',
-								getAggregateVotesInPollMessage({
-									message: pollCreation,
-									pollUpdates: update.pollUpdates,
-								})
-							)
-						}
-					}
-				}
+				console.log(events['messages.update'])
 			}
 
 			if(events['message-receipt.update']) {
@@ -152,19 +147,6 @@ const startSock = async() => {
 				console.log(events['chats.update'])
 			}
 
-			if(events['contacts.update']) {
-				for(const contact of events['contacts.update']) {
-					if(typeof contact.imgUrl !== 'undefined') {
-						const newUrl = contact.imgUrl === null
-							? null
-							: await sock!.profilePictureUrl(contact.id!).catch(() => null)
-						console.log(
-							`contact ${contact.id} has a new profile pic: ${newUrl}`,
-						)
-					}
-				}
-			}
-
 			if(events['chats.delete']) {
 				console.log('chats deleted ', events['chats.delete'])
 			}
@@ -172,16 +154,6 @@ const startSock = async() => {
 	)
 
 	return sock
-
-	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
-		if(store) {
-			const msg = await store.loadMessage(key.remoteJid!, key.id!)
-			return msg?.message || undefined
-		}
-
-		// only if store is present
-		return proto.Message.fromObject({})
-	}
 }
 
 startSock()

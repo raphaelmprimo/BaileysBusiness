@@ -1,8 +1,7 @@
-import { AxiosRequestConfig } from 'axios'
 import { promisify } from 'util'
 import { inflate } from 'zlib'
 import { proto } from '../../WAProto'
-import { Chat, Contact, WAMessageStubType } from '../Types'
+import { Chat, Contact, InitialReceivedChatsState } from '../Types'
 import { isJidUser } from '../WABinary'
 import { toNumber } from './generics'
 import { normalizeMessageContent } from './messages'
@@ -10,17 +9,12 @@ import { downloadContentFromMessage } from './messages-media'
 
 const inflatePromise = promisify(inflate)
 
-export const downloadHistory = async(
-	msg: proto.Message.IHistorySyncNotification,
-	options: AxiosRequestConfig<any>
-) => {
-	const stream = await downloadContentFromMessage(msg, 'md-msg-hist', { options })
-	const bufferArray: Buffer[] = []
+export const downloadHistory = async(msg: proto.Message.IHistorySyncNotification) => {
+	const stream = await downloadContentFromMessage(msg, 'history')
+	let buffer = Buffer.from([])
 	for await (const chunk of stream) {
-		bufferArray.push(chunk)
+		buffer = Buffer.concat([buffer, chunk])
 	}
-
-	let buffer = Buffer.concat(bufferArray)
 
 	// decompress buffer
 	buffer = await inflatePromise(buffer)
@@ -29,7 +23,11 @@ export const downloadHistory = async(
 	return syncData
 }
 
-export const processHistoryMessage = (item: proto.IHistorySync) => {
+export const processHistoryMessage = (
+	item: proto.IHistorySync,
+	historyCache: Set<string>,
+	recvChats: InitialReceivedChatsState
+) => {
 	const messages: proto.IWebMessageInfo[] = []
 	const contacts: Contact[] = []
 	const chats: Chat[] = []
@@ -37,76 +35,80 @@ export const processHistoryMessage = (item: proto.IHistorySync) => {
 	switch (item.syncType) {
 	case proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP:
 	case proto.HistorySync.HistorySyncType.RECENT:
-	case proto.HistorySync.HistorySyncType.FULL:
-		for(const chat of item.conversations! as Chat[]) {
-			contacts.push({ id: chat.id, name: chat.name || undefined })
+		for(const chat of item.conversations!) {
+			const contactId = `c:${chat.id}`
+			if(chat.name && !historyCache.has(contactId)) {
+				contacts.push({ id: chat.id, name: chat.name })
+				historyCache.add(contactId)
+			}
 
 			const msgs = chat.messages || []
-			delete chat.messages
-			delete chat.archived
-			delete chat.muteEndTime
-			delete chat.pinned
-
 			for(const item of msgs) {
 				const message = item.message!
-				messages.push(message)
+				const uqId = `${message.key.remoteJid}:${message.key.id}`
+				if(!historyCache.has(uqId)) {
+					messages.push(message)
 
-				if(!chat.messages?.length) {
-					// keep only the most recent message in the chat array
-					chat.messages = [{ message }]
-				}
+					const curItem = recvChats[message.key.remoteJid!]
+					const timestamp = toNumber(message.messageTimestamp)
+					if(!message.key.fromMe && (!curItem || timestamp > curItem.lastMsgRecvTimestamp)) {
+						recvChats[chat.id] = { lastMsgRecvTimestamp: timestamp }
+						// keep only the most recent message in the chat array
+						chat.messages = [{ message }]
+					}
 
-				if(!message.key.fromMe && !chat.lastMessageRecvTimestamp) {
-					chat.lastMessageRecvTimestamp = toNumber(message.messageTimestamp)
-				}
-
-				if(
-					(message.messageStubType === WAMessageStubType.BIZ_PRIVACY_MODE_TO_BSP
-					|| message.messageStubType === WAMessageStubType.BIZ_PRIVACY_MODE_TO_FB
-					)
-					&& message.messageStubParameters?.[0]
-				) {
-					contacts.push({
-						id: message.key.participant || message.key.remoteJid!,
-						verifiedName: message.messageStubParameters?.[0],
-					})
+					historyCache.add(uqId)
 				}
 			}
 
-			if(isJidUser(chat.id) && chat.readOnly && chat.archived) {
-				delete chat.readOnly
-			}
+			if(!historyCache.has(chat.id)) {
+				if(isJidUser(chat.id) && chat.readOnly && chat.archived) {
+					chat.readOnly = false
+				}
 
-			chats.push({ ...chat })
+				chats.push(chat)
+				historyCache.add(chat.id)
+			}
 		}
 
 		break
 	case proto.HistorySync.HistorySyncType.PUSH_NAME:
 		for(const c of item.pushnames!) {
-			contacts.push({ id: c.id!, notify: c.pushname! })
+			const contactId = `c:${c.id}`
+			if(!historyCache.has(contactId)) {
+				contacts.push({ notify: c.pushname!, id: c.id! })
+				historyCache.add(contactId)
+			}
 		}
 
 		break
+	case proto.HistorySync.HistorySyncType.INITIAL_STATUS_V3:
+		// TODO
+		break
 	}
+
+	const didProcess = !!(chats.length || messages.length || contacts.length)
 
 	return {
 		chats,
 		contacts,
 		messages,
+		didProcess,
 	}
 }
 
 export const downloadAndProcessHistorySyncNotification = async(
 	msg: proto.Message.IHistorySyncNotification,
-	options: AxiosRequestConfig<any>
+	historyCache: Set<string>,
+	recvChats: InitialReceivedChatsState
 ) => {
-	const historyMsg = await downloadHistory(msg, options)
-	return processHistoryMessage(historyMsg)
+	const historyMsg = await downloadHistory(msg)
+	return processHistoryMessage(historyMsg, historyCache, recvChats)
 }
 
-export const getHistoryMsg = (message: proto.IMessage) => {
+export const isHistoryMsg = (message: proto.IMessage) => {
 	const normalizedContent = !!message ? normalizeMessageContent(message) : undefined
-	const anyHistoryMsg = normalizedContent?.protocolMessage?.historySyncNotification
+	const isAnyHistoryMsg = !!normalizedContent?.protocolMessage?.historySyncNotification
 
-	return anyHistoryMsg
+	return isAnyHistoryMsg
 }

@@ -1,7 +1,7 @@
 import { proto } from '../../WAProto'
-import { GroupMetadata, GroupParticipant, ParticipantAction, SocketConfig, WAMessageKey, WAMessageStubType } from '../Types'
+import { GroupMetadata, ParticipantAction, SocketConfig, WAMessageKey, WAMessageStubType } from '../Types'
 import { generateMessageID, unixTimestampSeconds } from '../Utils'
-import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, getBinaryNodeChildString, jidEncode, jidNormalizedUser } from '../WABinary'
+import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, jidEncode, jidNormalizedUser } from '../WABinary'
 import { makeChatsSocket } from './chats'
 
 export const makeGroupsSocket = (config: SocketConfig) => {
@@ -256,7 +256,7 @@ export const extractGroupMetadata = (result: BinaryNode) => {
 	let desc: string | undefined
 	let descId: string | undefined
 	if(descChild) {
-		desc = getBinaryNodeChildString(descChild, 'body')
+		desc = getBinaryNodeChild(descChild, 'body')?.content as string
 		descId = descChild.attrs.id
 	}
 
@@ -278,7 +278,7 @@ export const extractGroupMetadata = (result: BinaryNode) => {
 			({ attrs }) => {
 				return {
 					id: attrs.jid,
-					admin: (attrs.type || null) as GroupParticipant['admin'],
+					admin: attrs.type || null as any,
 				}
 			}
 		),

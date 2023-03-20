@@ -2,19 +2,12 @@ import { Boom } from '@hapi/boom'
 import { createHash } from 'crypto'
 import { CatalogCollection, CatalogStatus, OrderDetails, OrderProduct, Product, ProductCreate, ProductUpdate, WAMediaUpload, WAMediaUploadFunction } from '../Types'
 import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, getBinaryNodeChildString } from '../WABinary'
-import { getStream, getUrlFromDirectPath, toReadable } from './messages-media'
+import { getStream, toReadable } from './messages-media'
 
 export const parseCatalogNode = (node: BinaryNode) => {
 	const catalogNode = getBinaryNodeChild(node, 'product_catalog')
 	const products = getBinaryNodeChildren(catalogNode, 'product').map(parseProductNode)
-	const paging = getBinaryNodeChild(catalogNode, 'paging')
-
-	return {
-		products,
-		nextPageCursor: paging
-			? getBinaryNodeChildString(paging, 'after')
-			: undefined
-	}
+	return { products }
 }
 
 export const parseCollectionsNode = (node: BinaryNode) => {
@@ -148,7 +141,7 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 
 	if('originCountryCode' in product) {
 		if(typeof product.originCountryCode === 'undefined') {
-			attrs['compliance_category'] = 'COUNTRY_ORIGIN_EXEMPT'
+			attrs.compliance_category = 'COUNTRY_ORIGIN_EXEMPT'
 		} else {
 			content.push({
 				tag: 'compliance_info',
@@ -166,7 +159,7 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 
 
 	if(typeof product.isHidden !== 'undefined') {
-		attrs['is_hidden'] = product.isHidden.toString()
+		attrs.is_hidden = product.isHidden.toString()
 	}
 
 	const node: BinaryNode = {
@@ -217,11 +210,7 @@ export async function uploadingNecessaryImagesOfProduct<T extends ProductUpdate 
 /**
  * Uploads images not already uploaded to WA's servers
  */
-export const uploadingNecessaryImages = async(
-	images: WAMediaUpload[],
-	waUploadToServer: WAMediaUploadFunction,
-	timeoutMs = 30_000
-) => {
+export const uploadingNecessaryImages = async(images: WAMediaUpload[], waUploadToServer: WAMediaUploadFunction, timeoutMs = 30_000) => {
 	const results = await Promise.all(
 		images.map<Promise<{ url: string }>>(
 			async img => {
@@ -243,15 +232,11 @@ export const uploadingNecessaryImages = async(
 
 				const sha = hasher.digest('base64')
 
-				const { directPath } = await waUploadToServer(
+				const { mediaUrl } = await waUploadToServer(
 					toReadable(Buffer.concat(contentBlocks)),
-					{
-						mediaType: 'product-catalog-image',
-						fileEncSha256B64: sha,
-						timeoutMs
-					}
+					{ mediaType: 'image', fileEncSha256B64: sha, timeoutMs }
 				)
-				return { url: getUrlFromDirectPath(directPath) }
+				return { url: mediaUrl }
 			}
 		)
 	)
