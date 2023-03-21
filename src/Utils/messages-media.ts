@@ -288,7 +288,7 @@ type EncryptedStreamOptions = {
 }
 
 //! changed the parameters
-xport const encryptedStream = async(
+export const encryptedStream = async(
 	media: WAMediaUpload,
 	mediaType: MediaType,
 	{ logger, saveOriginalFileIfRequired, opts }: EncryptedStreamOptions = {}
