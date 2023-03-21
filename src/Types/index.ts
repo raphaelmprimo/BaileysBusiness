@@ -9,7 +9,7 @@ export * from './Socket'
 export * from './Events'
 export * from './Product'
 export * from './Call'
-
+import { AxiosRequestConfig } from 'axios'
 import type NodeCache from 'node-cache'
 import { proto } from '../../WAProto'
 import { AuthenticationState, TransactionCapabilityOptions } from './Auth'
@@ -38,6 +38,8 @@ export type SocketConfig = CommonSocketConfig & {
     syncFullHistory: boolean
     /** Should baileys fire init queries automatically, default true */
     fireInitQueries: boolean
+
+    options: AxiosRequestConfig<{}>
     /**
      * fetch a message from your store
      * implement this so that messages failed to send (solves the "this message can take a while" issue) can be retried

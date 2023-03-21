@@ -1,5 +1,6 @@
 import type { proto } from '../../WAProto'
 import type { AccountSettings } from './Auth'
+import type { BufferedEventData } from './Events'
 import type { MinimalMessage } from './Message'
 
 /** set of statuses visible to other people; see updatePresence() in WhatsAppWeb.Send */
@@ -40,6 +41,19 @@ export type Chat = proto.IConversation & {
     pin?: number | null
     archive?: boolean
 }
+
+export type ChatUpdate = Partial<Chat & {
+    /**
+     * if specified in the update,
+     * the EV buffer will check if the condition gets fulfilled before applying the update
+     * Right now, used to determine when to release an app state sync event
+     *
+     * @returns true, if the update should be applied;
+     * false if it can be discarded;
+     * undefined if the condition is not yet fulfilled
+     * */
+    conditional: (bufferedData: BufferedEventData) => boolean | undefined
+}>
 
 /**
  * the last messages in a chat, sorted reverse-chronologically. That is, the latest message should be first in the chat

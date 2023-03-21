@@ -11,8 +11,8 @@ import type { Logger } from 'pino'
 import { Readable, Transform } from 'stream'
 import { URL } from 'url'
 import { proto } from '../../WAProto'
-import { DEFAULT_ORIGIN, MEDIA_PATH_MAP } from '../Defaults'
-import { BaileysEventMap, CommonSocketConfig, DownloadableMessage, MediaConnInfo, MediaDecryptionKeyInfo, MediaType, MessageType, WAGenericMediaMessage, WAMediaUpload, WAMediaUploadFunction, WAMessageContent } from '../Types'
+import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP } from '../Defaults'
+import { BaileysEventMap, SocketConfig, DownloadableMessage, MediaConnInfo, MediaDecryptionKeyInfo, MediaType, MessageType, WAGenericMediaMessage, WAMediaUpload, WAMediaUploadFunction, WAMessageContent } from '../Types'
 import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildBuffer, jidNormalizedUser } from '../WABinary'
 import { aesDecryptGCM, aesEncryptGCM, hkdf } from './crypto'
 import { generateMessageID } from './generics'
@@ -40,6 +40,7 @@ const getImageProcessingLibrary = async() => {
 		return { sharp }
 	}
 
+	const jimp = _jimp?.default || _jimp
 	if(jimp) {
 		return { jimp }
 	}
@@ -48,16 +49,7 @@ const getImageProcessingLibrary = async() => {
 }
 
 export const hkdfInfoKey = (type: MediaType) => {
-	let str: string = type
-	if(type === 'sticker') {
-		str = 'image'
-	}
-
-	if(type === 'md-app-state') {
-		str = 'App State'
-	}
-
-	const hkdfInfo = str[0].toUpperCase() + str.slice(1)
+	const hkdfInfo = MEDIA_HKDF_KEY_MAPPING[type]
 	return `WhatsApp ${hkdfInfo} Keys`
 }
 
@@ -85,7 +77,7 @@ const extractVideoThumb = async(
 	path: string,
 	destPath: string,
 	time: string,
-	size: { width: number; height: number },
+	size: { width: number, height: number },
 ) => new Promise((resolve, reject) => {
     	const cmd = `ffmpeg -ss ${time} -i ${path} -y -vf scale=${size.width}:-1 -vframes 1 -f image2 ${destPath}`
     	exec(cmd, (err) => {
@@ -103,23 +95,50 @@ export const extractImageThumb = async(bufferOrFilePath: Readable | Buffer | str
 	}
 
 	const lib = await getImageProcessingLibrary()
-	if('sharp' in lib) {
-		const result = await lib.sharp!.default(bufferOrFilePath)
+	if('sharp' in lib && typeof lib.sharp?.default === 'function') {
+		const img = lib.sharp!.default(bufferOrFilePath)
+		const dimensions = await img.metadata()
+
+		const buffer = await img
 			.resize(width)
 			.jpeg({ quality: 50 })
 			.toBuffer()
-		return result
-	} else {
+		return {
+			buffer,
+			original: {
+				width: dimensions.width,
+				height: dimensions.height,
+			},
+		}
+	} else if('jimp' in lib && typeof lib.jimp?.read === 'function') {
 		const { read, MIME_JPEG, RESIZE_BILINEAR, AUTO } = lib.jimp
 
 		const jimp = await read(bufferOrFilePath as any)
-		const result = await jimp
+		const dimensions = {
+			width: jimp.getWidth(),
+			height: jimp.getHeight()
+		}
+		const buffer = await jimp
 			.quality(50)
 			.resize(width, AUTO, RESIZE_BILINEAR)
 			.getBufferAsync(MIME_JPEG)
-		return result
+		return {
+			buffer,
+			original: dimensions
+		}
+	} else {
+		throw new Boom('No image processing library available')
 	}
 }
+
+export const encodeBase64EncodedStringForUpload = (b64: string) => (
+	encodeURIComponent(
+		b64
+			.replace(/\+/g, '-')
+			.replace(/\//g, '_')
+			.replace(/\=+$/, '')
+	)
+)
 
 export const generateProfilePicture = async(mediaUpload: WAMediaUpload) => {
 	let bufferOrFilePath: Buffer | string
@@ -133,14 +152,14 @@ export const generateProfilePicture = async(mediaUpload: WAMediaUpload) => {
 
 	const lib = await getImageProcessingLibrary()
 	let img: Promise<Buffer>
-	if('sharp' in lib) {
+	if('sharp' in lib && typeof lib.sharp?.default === 'function') {
 		img = lib.sharp!.default(bufferOrFilePath)
 			.resize(640, 640)
 			.jpeg({
 				quality: 50,
 			})
 			.toBuffer()
-	} else {
+	} else if('jimp' in lib && typeof lib.jimp?.read === 'function') {
 		const { read, MIME_JPEG, RESIZE_BILINEAR } = lib.jimp
 		const jimp = await read(bufferOrFilePath as any)
 		const min = Math.min(jimp.getWidth(), jimp.getHeight())
@@ -150,6 +169,8 @@ export const generateProfilePicture = async(mediaUpload: WAMediaUpload) => {
 			.quality(50)
 			.resize(640, 640, RESIZE_BILINEAR)
 			.getBufferAsync(MIME_JPEG)
+	} else {
+		throw new Boom('No image processing library available')
 	}
 
 	return {
@@ -170,8 +191,11 @@ export async function getAudioDuration(buffer: Buffer | string | Readable) {
 		metadata = await musicMetadata.parseBuffer(buffer, undefined, { duration: true })
 	} else if(typeof buffer === 'string') {
 		const rStream = createReadStream(buffer)
-		metadata = await musicMetadata.parseStream(rStream, undefined, { duration: true })
-		rStream.close()
+		try {
+			metadata = await musicMetadata.parseStream(rStream, undefined, { duration: true })
+		} finally {
+			rStream.destroy()
+		}
 	} else {
 		metadata = await musicMetadata.parseStream(buffer, undefined, { duration: true })
 	}
@@ -187,32 +211,33 @@ export const toReadable = (buffer: Buffer) => {
 }
 
 export const toBuffer = async(stream: Readable) => {
-	let buff = Buffer.alloc(0)
+	const chunks: Buffer[] = []
 	for await (const chunk of stream) {
-		buff = Buffer.concat([ buff, chunk ])
+		chunks.push(chunk)
 	}
 
 	stream.destroy()
-	return buff
+	return Buffer.concat(chunks)
 }
 
-export const getStream = async(item: WAMediaUpload) => {
+export const getStream = async(item: WAMediaUpload, opts?: AxiosRequestConfig) => {
 	if(Buffer.isBuffer(item)) {
-		return { stream: toReadable(item), type: 'buffer' }
+		return { stream: toReadable(item), type: 'buffer' } as const
 	}
 
 	if('stream' in item) {
-		return { stream: item.stream, type: 'readable' }
+		return { stream: item.stream, type: 'readable' } as const
 	}
 
 	if(item.url.toString().startsWith('http://') || item.url.toString().startsWith('https://')) {
-		return { stream: await getHttpStream(item.url), type: 'remote' }
+		return { stream: await getHttpStream(item.url, opts), type: 'remote' } as const
 	}
 
-	return { stream: createReadStream(item.url), type: 'file' }
+	return { stream: createReadStream(item.url), type: 'file' } as const
 }
 
 /** generates a thumbnail for a given media, if required */
+// ! changed the return
 export async function generateThumbnail(
 	file: string,
 	mediaType: 'video' | 'image',
@@ -221,9 +246,16 @@ export async function generateThumbnail(
     }
 ) {
 	let thumbnail: string | undefined
+	let originalImageDimensions: { width: number, height: number } | undefined
 	if(mediaType === 'image') {
-		const buff = await extractImageThumb(file)
-		thumbnail = buff.toString('base64')
+		const { buffer, original } = await extractImageThumb(file)
+		thumbnail = buffer.toString('base64')
+		if(original.width && original.height) {
+			originalImageDimensions = {
+				width: original.width,
+				height: original.height,
+			}
+		}
 	} else if(mediaType === 'video') {
 		const imgFilename = join(getTmpFilesDirectory(), generateMessageID() + '.jpg')
 		try {
@@ -237,7 +269,10 @@ export async function generateThumbnail(
 		}
 	}
 
-	return thumbnail
+	return {
+		thumbnail,
+		originalImageDimensions
+	}
 }
 
 export const getHttpStream = async(url: string | URL, options: AxiosRequestConfig & { isStream?: true } = {}) => {
@@ -246,21 +281,24 @@ export const getHttpStream = async(url: string | URL, options: AxiosRequestConfi
 	return fetched.data as Readable
 }
 
-export const encryptedStream = async(
+type EncryptedStreamOptions = {
+	saveOriginalFileIfRequired?: boolean
+	logger?: Logger
+	opts?: AxiosRequestConfig
+}
+
+//! changed the parameters
+xport const encryptedStream = async(
 	media: WAMediaUpload,
 	mediaType: MediaType,
-	saveOriginalFileIfRequired = true,
-	logger?: Logger
+	{ logger, saveOriginalFileIfRequired, opts }: EncryptedStreamOptions = {}
 ) => {
-	const { stream, type } = await getStream(media)
+	const { stream, type } = await getStream(media, opts)
 
 	logger?.debug('fetched media stream')
 
 	const mediaKey = Crypto.randomBytes(32)
 	const { cipherKey, iv, macKey } = getMediaKeys(mediaKey, mediaType)
-	// random name
-	//const encBodyPath = join(getTmpFilesDirectory(), mediaType + generateMessageID() + '.enc')
-	// const encWriteStream = createWriteStream(encBodyPath)
 	const encWriteStream = new Readable({ read: () => {} })
 
 	let bodyPath: string | undefined
@@ -280,15 +318,23 @@ export const encryptedStream = async(
 	let sha256Plain = Crypto.createHash('sha256')
 	let sha256Enc = Crypto.createHash('sha256')
 
-	const onChunk = (buff: Buffer) => {
-		sha256Enc = sha256Enc.update(buff)
-		hmac = hmac.update(buff)
-		encWriteStream.push(buff)
-	}
-
 	try {
 		for await (const data of stream) {
 			fileLength += data.length
+
+			if(
+				type === 'remote'
+				&& opts?.maxContentLength
+				&& fileLength + data.length > opts.maxContentLength
+			) {
+				throw new Boom(
+					`content length exceeded when encrypting "${type}"`,
+					{
+						data: { media, type }
+					}
+				)
+			}
+
 			sha256Plain = sha256Plain.update(data)
 			if(writeStream) {
 				if(!writeStream.write(data)) {
@@ -310,7 +356,7 @@ export const encryptedStream = async(
 		encWriteStream.push(mac)
 		encWriteStream.push(null)
 
-		writeStream && writeStream.end()
+		writeStream?.end()
 		stream.destroy()
 
 		logger?.debug('encrypted data successfully')
@@ -326,15 +372,30 @@ export const encryptedStream = async(
 			didSaveToTmpPath
 		}
 	} catch(error) {
-		encWriteStream.destroy(error)
-		writeStream?.destroy(error)
-		aes.destroy(error)
-		hmac.destroy(error)
-		sha256Plain.destroy(error)
-		sha256Enc.destroy(error)
-		stream.destroy(error)
+		// destroy all streams with error
+		encWriteStream.destroy()
+		writeStream?.destroy()
+		aes.destroy()
+		hmac.destroy()
+		sha256Plain.destroy()
+		sha256Enc.destroy()
+		stream.destroy()
+
+		if(didSaveToTmpPath) {
+			try {
+				await fs.unlink(bodyPath!)
+			} catch(err) {
+				logger?.error({ err }, 'failed to save to tmp path')
+			}
+		}
 
 		throw error
+	}
+
+	function onChunk(buff: Buffer) {
+		sha256Enc = sha256Enc.update(buff)
+		hmac = hmac.update(buff)
+		encWriteStream.push(buff)
 	}
 }
 
@@ -348,6 +409,7 @@ const toSmallestChunkSize = (num: number) => {
 export type MediaDownloadOptions = {
     startByte?: number
     endByte?: number
+	options?: AxiosRequestConfig<any>
 }
 
 export const getUrlFromDirectPath = (directPath: string) => `https://${DEF_HOST}${directPath}`
@@ -370,7 +432,7 @@ export const downloadContentFromMessage = (
 export const downloadEncryptedContent = async(
 	downloadUrl: string,
 	{ cipherKey, iv }: MediaDecryptionKeyInfo,
-	{ startByte, endByte }: MediaDownloadOptions = { }
+	{ startByte, endByte, options }: MediaDownloadOptions = { }
 ) => {
 	let bytesFetched = 0
 	let startChunk = 0
@@ -388,13 +450,14 @@ export const downloadEncryptedContent = async(
 
 	const endChunk = endByte ? toSmallestChunkSize(endByte || 0) + AES_CHUNK_SIZE : undefined
 
-	const headers: { [_: string]: string } = {
+	const headers: AxiosRequestConfig['headers'] = {
+		...options?.headers || { },
 		Origin: DEFAULT_ORIGIN,
 	}
 	if(startChunk || endChunk) {
-		headers.Range = `bytes=${startChunk}-`
+		headers!.Range = `bytes=${startChunk}-`
 		if(endChunk) {
-			headers.Range += endChunk
+			headers!.Range += endChunk
 		}
 	}
 
@@ -402,6 +465,7 @@ export const downloadEncryptedContent = async(
 	const fetched = await getHttpStream(
 		downloadUrl,
 		{
+			...options || { },
 			headers,
 			maxBodyLength: Infinity,
 			maxContentLength: Infinity,
@@ -486,7 +550,10 @@ export function extensionForMediaMessage(message: WAMessageContent) {
 	return extension
 }
 
-export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: CommonSocketConfig, refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>): WAMediaUploadFunction => {
+export const getWAUploadToServer = (
+	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
+	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>,
+): WAMediaUploadFunction => {
 	return async(stream, { mediaType, fileEncSha256B64, timeoutMs }) => {
 		const { default: axios } = await import('axios')
 		// send a query JSON to obtain the url & auth token to upload our media
@@ -501,6 +568,7 @@ export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: C
 		}
 
 		const reqBody = Buffer.concat(chunks)
+		fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileEncSha256B64)
 
 		for(const { hostname, maxContentLengthBytes } of hosts) {
 			logger.debug(`uploading to "${hostname}"`)
@@ -517,7 +585,9 @@ export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: C
 					url,
 					reqBody,
 					{
+						...options,
 						headers: {
+							...options.headers || { },
 							'Content-Type': 'application/octet-stream',
 							'Origin': DEFAULT_ORIGIN
 						},
@@ -603,7 +673,7 @@ export const encryptMediaRetryRequest = (
 				tag: 'rmr',
 				attrs: {
 					jid: key.remoteJid!,
-					from_me: (!!key.fromMe).toString(),
+					'from_me': (!!key.fromMe).toString(),
 					// @ts-ignore
 					participant: key.participant || undefined
 				}
@@ -617,7 +687,7 @@ export const encryptMediaRetryRequest = (
 export const decodeMediaRetryNode = (node: BinaryNode) => {
 	const rmrNode = getBinaryNodeChild(node, 'rmr')!
 
-	const event: BaileysEventMap<any>['messages.media-update'][number] = {
+	const event: BaileysEventMap['messages.media-update'][number] = {
 		key: {
 			id: node.attrs.id,
 			remoteJid: rmrNode.attrs.jid,
