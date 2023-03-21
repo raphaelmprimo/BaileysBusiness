@@ -7,6 +7,7 @@ import { MEDIA_KEYS, URL_EXCLUDE_REGEX, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '
 import {
 	AnyMediaMessageContent,
 	AnyMessageContent,
+	DownloadableMessage,
 	MediaGenerationOptions,
 	MediaType,
 	MessageContentGenerationOptions,
@@ -35,16 +36,17 @@ type MediaUploadData = {
 	fileName?: string
 	jpegThumbnail?: string
 	mimetype?: string
+	width?: number
+	height?: number
 }
 
-const MIMETYPE_MAP: { [T in MediaType]: string } = {
+const MIMETYPE_MAP: { [T in MediaType]?: string } = {
 	image: 'image/jpeg',
 	video: 'video/mp4',
 	document: 'application/pdf',
 	audio: 'audio/ogg; codecs=opus',
 	sticker: 'image/webp',
-	history: 'application/x-protobuf',
-	'md-app-state': 'application/x-protobuf',
+	'product-catalog-image': 'image/jpeg',
 }
 
 const MessageTypeProto = {
@@ -144,15 +146,13 @@ export const prepareWAMessageMedia = async(
 		fileSha256,
 		fileLength,
 		didSaveToTmpPath
-	} = await encryptedStream(uploadData.media, mediaType, requiresOriginalForSomeProcessing)
-	 // url safe Base64 encode the SHA256 hash of the body
-	const fileEncSha256B64 = encodeURIComponent(
-		fileEncSha256.toString('base64')
-			.replace(/\+/g, '-')
-			.replace(/\//g, '_')
-			.replace(/\=+$/, '')
+	} = await encryptedStream(
+		uploadData.media,
+		options.mediaTypeOverride || mediaType,
+		requiresOriginalForSomeProcessing
 	)
-
+	 // url safe Base64 encode the SHA256 hash of the body
+	const fileEncSha256B64 = fileEncSha256.toString('base64')
 	const [{ mediaUrl, directPath }] = await Promise.all([
 		(async() => {
 			const result = await options.upload(
@@ -165,7 +165,17 @@ export const prepareWAMessageMedia = async(
 		(async() => {
 			try {
 				if(requiresThumbnailComputation) {
-					uploadData.jpegThumbnail = await generateThumbnail(bodyPath!, mediaType as any, options)
+					const {
+						thumbnail,
+						originalImageDimensions
+					} = await generateThumbnail(bodyPath!, mediaType as any, options)
+					uploadData.jpegThumbnail = thumbnail
+					if(!uploadData.width && originalImageDimensions) {
+						uploadData.width = originalImageDimensions.width
+						uploadData.height = originalImageDimensions.height
+						logger?.debug('set dimensions')
+					}
+
 					logger?.debug('generated thumbnail')
 				}
 
@@ -286,6 +296,17 @@ export const generateWAMessageContent = async(
 			extContent.description = urlInfo.description
 			extContent.title = urlInfo.title
 			extContent.previewType = 0
+
+			const img = urlInfo.highQualityThumbnail
+			if(img) {
+				extContent.thumbnailDirectPath = img.directPath
+				extContent.mediaKey = img.mediaKey
+				extContent.mediaKeyTimestamp = img.mediaKeyTimestamp
+				extContent.thumbnailWidth = img.width
+				extContent.thumbnailHeight = img.height
+				extContent.thumbnailSha256 = img.fileSha256
+				extContent.thumbnailEncSha256 = img.fileEncSha256
+			}
 		}
 
 		m.extendedTextMessage = extContent
@@ -352,6 +373,8 @@ export const generateWAMessageContent = async(
 				productImage: imageMessage,
 			}
 		})
+	} else if('listReply' in message) {
+		m.listResponseMessage = { ...message.listReply }
 	} else {
 		m = await prepareWAMessageMedia(
 			message,
@@ -546,12 +569,31 @@ export const getContentType = (content: WAProto.IMessage | undefined) => {
  * @returns
  */
 export const normalizeMessageContent = (content: WAMessageContent | null | undefined): WAMessageContent | undefined => {
-	content = content?.ephemeralMessage?.message?.viewOnceMessage?.message ||
-				content?.ephemeralMessage?.message ||
-				content?.viewOnceMessage?.message ||
-				content ||
-				undefined
-	return content
+	if(!content) {
+		return undefined
+	}
+
+	// set max iterations to prevent an infinite loop
+	for(let i = 0;i < 5;i++) {
+		const inner = getFutureProofMessage(content)
+		if(!inner) {
+			break
+		}
+
+		content = inner.message
+	}
+
+	return content!
+
+	function getFutureProofMessage(message: typeof content) {
+		return (
+			message?.ephemeralMessage
+			|| message?.viewOnceMessage
+			|| message?.documentWithCaptionMessage
+			|| message?.viewOnceMessageV2
+			|| message?.editedMessage
+		)
+	}
 }
 
 /**
@@ -569,7 +611,12 @@ export const extractMessageContent = (content: WAMessageContent | undefined | nu
 		} else if(msg.locationMessage) {
 			return { locationMessage: msg.locationMessage }
 		} else {
-			return { conversation: 'contentText' in msg ? msg.contentText : ('hydratedContentText' in msg ? msg.hydratedContentText : '') }
+			return {
+				conversation:
+					'contentText' in msg
+						? msg.contentText
+						: ('hydratedContentText' in msg ? msg.hydratedContentText : '')
+			}
 		}
 	}
 
@@ -694,20 +741,32 @@ export const downloadMediaMessage = async(
 		}
 
 		const contentType = getContentType(mContent)
-		const mediaType = contentType?.replace('Message', '') as MediaType
+		let mediaType = contentType?.replace('Message', '') as MediaType
 		const media = mContent[contentType!]
-		if(!media || typeof media !== 'object' || !('url' in media)) {
+
+		if(!media || typeof media !== 'object' || (!('url' in media) && !('thumbnailDirectPath' in media))) {
 			throw new Boom(`"${contentType}" message is not a media message`)
 		}
 
-		const stream = await downloadContentFromMessage(media, mediaType, options)
+		let download: DownloadableMessage
+		if('thumbnailDirectPath' in media && !('url' in media)) {
+			download = {
+				directPath: media.thumbnailDirectPath,
+				mediaKey: media.mediaKey
+			}
+			mediaType = 'thumbnail-link'
+		} else {
+			download = media
+		}
+
+		const stream = await downloadContentFromMessage(download, mediaType, options)
 		if(type === 'buffer') {
-			let buffer = Buffer.from([])
+			const bufferArray: Buffer[] = []
 			for await (const chunk of stream) {
-				buffer = Buffer.concat([buffer, chunk])
+				bufferArray.push(chunk)
 			}
 
-			return buffer
+			return Buffer.concat(bufferArray)
 		}
 
 		return stream
@@ -730,37 +789,4 @@ export const assertMediaContent = (content: proto.IMessage | null | undefined) =
 	}
 
 	return mediaContent
-}
-
-
-const generateContextInfo = () => {
-	const info: proto.IMessageContextInfo = {
-		deviceListMetadataVersion: 2,
-		deviceListMetadata: { }
-	}
-	return info
-}
-
-/**
- * this is an experimental patch to make buttons work
- * Don't know how it works, but it does for now
- */
-export const patchMessageForMdIfRequired = (message: proto.IMessage) => {
-	const requiresPatch = !!(
-		message.buttonsMessage
-		// || message.templateMessage
-		|| message.listMessage
-	)
-	if(requiresPatch) {
-		message = {
-			viewOnceMessage: {
-				message: {
-					messageContextInfo: generateContextInfo(),
-					...message
-				}
-			}
-		}
-	}
-
-	return message
 }

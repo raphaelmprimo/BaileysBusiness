@@ -2,7 +2,7 @@
 import { proto } from '../../WAProto'
 import { KEY_BUNDLE_TYPE, MIN_PREKEY_COUNT } from '../Defaults'
 import { MessageReceiptType, MessageRelayOptions, MessageUserReceipt, SocketConfig, WACallEvent, WAMessageKey, WAMessageStubType, WAPatchName } from '../Types'
-import { decodeMediaRetryNode, decodeMessageStanza, delay, encodeBigEndian, encodeSignedDeviceIdentity, getCallStatusFromNode, getNextPreKeys, getStatusFromReceiptType, isHistoryMsg, unixTimestampSeconds, xmppPreKey, xmppSignedPreKey } from '../Utils'
+import { decodeMediaRetryNode, decodeMessageStanza, delay, encodeBigEndian, encodeSignedDeviceIdentity, getCallStatusFromNode, getHistoryMsg, getNextPreKeys, getStatusFromReceiptType, unixTimestampSeconds, xmppPreKey, xmppSignedPreKey } from '../Utils'
 import { makeMutex } from '../Utils/make-mutex'
 import { cleanMessage } from '../Utils/process-message'
 import { areJidsSameUser, BinaryNode, getAllBinaryNodeChildren, getBinaryNodeChild, getBinaryNodeChildren, isJidGroup, isJidUser, jidDecode, jidNormalizedUser, S_WHATSAPP_NET } from '../WABinary'
@@ -13,13 +13,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const {
 		logger,
 		retryRequestDelayMs,
-		getMessage
+		getMessage,
+		shouldIgnoreJid
 	} = config
 	const sock = makeMessagesSocket(config)
 	const {
 		ev,
 		authState,
 		ws,
+		query,
 		processingMutex,
 		upsertMessage,
 		resyncAppState,
@@ -63,6 +65,26 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		logger.debug({ recv: { tag, attrs }, sent: stanza.attrs }, 'sent ack')
 		await sendNode(stanza)
+	}
+
+	const rejectCall = async(callId: string, callFrom: string) => {
+		const stanza: BinaryNode = ({
+			tag: 'call',
+			attrs: {
+				from: authState.creds.me!.id,
+				to: callFrom,
+			},
+			content: [{
+			    tag: 'reject',
+			    attrs: {
+					'call-id': callId,
+					'call-creator': callFrom,
+					count: '0',
+			    },
+			    content: undefined,
+			}],
+		})
+		await query(stanza)
 	}
 
 	const sendRetryRequest = async(node: BinaryNode, forceIncludeKeys = false) => {
@@ -168,90 +190,169 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
+	const handleGroupNotification = (
+		participant: string,
+		child: BinaryNode,
+		msg: Partial<proto.IWebMessageInfo>
+	) => {
+		switch (child?.tag) {
+		case 'create':
+			const metadata = extractGroupMetadata(child)
+
+			msg.messageStubType = WAMessageStubType.GROUP_CREATE
+			msg.messageStubParameters = [metadata.subject]
+			msg.key = { participant: metadata.owner }
+
+			ev.emit('chats.upsert', [{
+				id: metadata.id,
+				name: metadata.subject,
+				conversationTimestamp: metadata.creation,
+			}])
+			ev.emit('groups.upsert', [metadata])
+			break
+		case 'ephemeral':
+		case 'not_ephemeral':
+			msg.message = {
+				protocolMessage: {
+					type: proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
+					ephemeralExpiration: +(child.attrs.expiration || 0)
+				}
+			}
+			break
+		case 'promote':
+		case 'demote':
+		case 'remove':
+		case 'add':
+		case 'leave':
+			const stubType = `GROUP_PARTICIPANT_${child.tag!.toUpperCase()}`
+			msg.messageStubType = WAMessageStubType[stubType]
+
+			const participants = getBinaryNodeChildren(child, 'participant').map(p => p.attrs.jid)
+			if(
+				participants.length === 1 &&
+					// if recv. "remove" message and sender removed themselves
+					// mark as left
+					areJidsSameUser(participants[0], participant) &&
+					child.tag === 'remove'
+			) {
+				msg.messageStubType = WAMessageStubType.GROUP_PARTICIPANT_LEAVE
+			}
+
+			msg.messageStubParameters = participants
+			break
+		case 'subject':
+			msg.messageStubType = WAMessageStubType.GROUP_CHANGE_SUBJECT
+			msg.messageStubParameters = [ child.attrs.subject ]
+			break
+		case 'announcement':
+		case 'not_announcement':
+			msg.messageStubType = WAMessageStubType.GROUP_CHANGE_ANNOUNCE
+			msg.messageStubParameters = [ (child.tag === 'announcement') ? 'on' : 'off' ]
+			break
+		case 'locked':
+		case 'unlocked':
+			msg.messageStubType = WAMessageStubType.GROUP_CHANGE_RESTRICT
+			msg.messageStubParameters = [ (child.tag === 'locked') ? 'on' : 'off' ]
+			break
+		case 'invite':
+			msg.messageStubType = WAMessageStubType.GROUP_CHANGE_INVITE_LINK
+			msg.messageStubParameters = [ child.attrs.code ]
+			break
+		}
+	}
+
 	const processNotification = async(node: BinaryNode) => {
 		const result: Partial<proto.IWebMessageInfo> = { }
 		const [child] = getAllBinaryNodeChildren(node)
 		const nodeType = node.attrs.type
+		const from = jidNormalizedUser(node.attrs.from)
 
-		if(nodeType === 'w:gp2') {
-			switch (child?.tag) {
-			case 'create':
-				const metadata = extractGroupMetadata(child)
-
-				result.messageStubType = WAMessageStubType.GROUP_CREATE
-				result.messageStubParameters = [metadata.subject]
-				result.key = { participant: metadata.owner }
-
-				ev.emit('chats.upsert', [{
-					id: metadata.id,
-					name: metadata.subject,
-					conversationTimestamp: metadata.creation,
-				}])
-				ev.emit('groups.upsert', [metadata])
-				break
-			case 'ephemeral':
-			case 'not_ephemeral':
-				result.message = {
-					protocolMessage: {
-						type: proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
-						ephemeralExpiration: +(child.attrs.expiration || 0)
+		switch (nodeType) {
+		case 'privacy_token':
+			const tokenList = getBinaryNodeChildren(child, 'token')
+			for(const { attrs, content } of tokenList) {
+				const jid = attrs.jid
+				ev.emit('chats.update', [
+					{
+						id: jid,
+						tcToken: content as Buffer
 					}
-				}
-				break
-			case 'promote':
-			case 'demote':
-			case 'remove':
-			case 'add':
-			case 'leave':
-				const stubType = `GROUP_PARTICIPANT_${child.tag!.toUpperCase()}`
-				result.messageStubType = WAMessageStubType[stubType]
+				])
 
-				const participants = getBinaryNodeChildren(child, 'participant').map(p => p.attrs.jid)
-				if(
-					participants.length === 1 &&
-                        // if recv. "remove" message and sender removed themselves
-                        // mark as left
-                        areJidsSameUser(participants[0], node.attrs.participant) &&
-                        child.tag === 'remove'
-				) {
-					result.messageStubType = WAMessageStubType.GROUP_PARTICIPANT_LEAVE
-				}
-
-				result.messageStubParameters = participants
-				break
-			case 'subject':
-				result.messageStubType = WAMessageStubType.GROUP_CHANGE_SUBJECT
-				result.messageStubParameters = [ child.attrs.subject ]
-				break
-			case 'announcement':
-			case 'not_announcement':
-				result.messageStubType = WAMessageStubType.GROUP_CHANGE_ANNOUNCE
-				result.messageStubParameters = [ (child.tag === 'announcement') ? 'on' : 'off' ]
-				break
-			case 'locked':
-			case 'unlocked':
-				result.messageStubType = WAMessageStubType.GROUP_CHANGE_RESTRICT
-				result.messageStubParameters = [ (child.tag === 'locked') ? 'on' : 'off' ]
-				break
-
+				logger.debug({ jid }, 'got privacy token update')
 			}
-		} else if(nodeType === 'mediaretry') {
+
+			break
+		case 'w:gp2':
+			handleGroupNotification(node.attrs.participant, child, result)
+			break
+		case 'mediaretry':
 			const event = decodeMediaRetryNode(node)
 			ev.emit('messages.media-update', [event])
-		} else if(nodeType === 'encrypt') {
+			break
+		case 'encrypt':
 			await handleEncryptNotification(node)
-		} else if(nodeType === 'devices') {
+			break
+		case 'devices':
 			const devices = getBinaryNodeChildren(child, 'device')
 			if(areJidsSameUser(child.attrs.jid, authState.creds!.me!.id)) {
 				const deviceJids = devices.map(d => d.attrs.jid)
 				logger.info({ deviceJids }, 'got my own devices')
 			}
-		} else if(nodeType === 'server_sync') {
+
+			break
+		case 'server_sync':
 			const update = getBinaryNodeChild(node, 'collection')
 			if(update) {
 				const name = update.attrs.name as WAPatchName
-				await resyncAppState([name], undefined)
+				await resyncAppState([name], false)
 			}
+
+			break
+		case 'picture':
+			const setPicture = getBinaryNodeChild(node, 'set')
+			const delPicture = getBinaryNodeChild(node, 'delete')
+
+			ev.emit('contacts.update', [{
+				id: from,
+				imgUrl: setPicture ? 'changed' : null
+			}])
+
+			if(isJidGroup(from)) {
+				const node = setPicture || delPicture
+				result.messageStubType = WAMessageStubType.GROUP_CHANGE_ICON
+
+				if(setPicture) {
+					result.messageStubParameters = [ setPicture.attrs.id ]
+				}
+
+				result.participant = node?.attrs.author
+				result.key = {
+					...result.key || {},
+					participant: setPicture?.attrs.author
+				}
+			}
+
+			break
+		case 'account_sync':
+			if(child.tag === 'disappearing_mode') {
+				const newDuration = +child.attrs.duration
+				const timestamp = +child.attrs.t
+
+				logger.info({ newDuration }, 'updated account disappearing mode')
+
+				ev.emit('creds.update', {
+					accountSettings: {
+						...authState.creds.accountSettings,
+						defaultDisappearingMode: {
+							ephemeralExpiration: newDuration,
+							ephemeralSettingTimestamp: timestamp,
+						},
+					}
+				})
+			}
+
+			break
 		}
 
 		if(Object.keys(result).length) {
@@ -318,17 +419,23 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const remoteJid = !isNodeFromMe || isJidGroup(attrs.from) ? attrs.from : attrs.recipient
 		const fromMe = !attrs.recipient || (attrs.type === 'retry' && isNodeFromMe)
 
-		const ids = [attrs.id]
-		if(Array.isArray(content)) {
-			const items = getBinaryNodeChildren(content[0], 'item')
-			ids.push(...items.map(i => i.attrs.id))
-		}
-
 		const key: proto.IMessageKey = {
 			remoteJid,
 			id: '',
 			fromMe,
 			participant: attrs.participant
+		}
+
+		if(shouldIgnoreJid(remoteJid)) {
+			logger.debug({ remoteJid }, 'ignoring receipt from jid')
+			await sendMessageAck(node)
+			return
+		}
+
+		const ids = [attrs.id]
+		if(Array.isArray(content)) {
+			const items = getBinaryNodeChildren(content[0], 'item')
+			ids.push(...items.map(i => i.attrs.id))
 		}
 
 		await Promise.all([
@@ -396,6 +503,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	const handleNotification = async(node: BinaryNode) => {
 		const remoteJid = node.attrs.from
+		if(shouldIgnoreJid(remoteJid)) {
+			logger.debug({ remoteJid, id: node.attrs.id }, 'ignored notification')
+			await sendMessageAck(node)
+			return
+		}
+
 		await Promise.all([
 			processingMutex.mutex(
 				async() => {
@@ -409,7 +522,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							id: node.attrs.id,
 							...(msg.key || {})
 						}
-						msg.participant = node.attrs.participant
+						msg.participant ??= node.attrs.participant
 						msg.messageTimestamp = +node.attrs.t
 
 						const fullMsg = proto.WebMessageInfo.fromObject(msg)
@@ -422,11 +535,17 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	const handleMessage = async(node: BinaryNode) => {
-		const { fullMessage: msg, category, author, decryptionTask } = decodeMessageStanza(node, authState)
+		const { fullMessage: msg, category, author, decrypt } = decodeMessageStanza(node, authState)
+		if(shouldIgnoreJid(msg.key.remoteJid!)) {
+			logger.debug({ key: msg.key }, 'ignored message')
+			await sendMessageAck(node)
+			return
+		}
+
 		await Promise.all([
 			processingMutex.mutex(
 				async() => {
-					await decryptionTask
+					await decrypt()
 					// message failed to decrypt
 					if(msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
 						logger.error(
@@ -464,9 +583,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 						await sendReceipt(msg.key.remoteJid!, participant!, [msg.key.id!], type)
 
-
 						// send ack for history message
-						const isAnyHistoryMsg = isHistoryMsg(msg.message!)
+						const isAnyHistoryMsg = getHistoryMsg(msg.message!)
 						if(isAnyHistoryMsg) {
 							const jid = jidNormalizedUser(msg.key.remoteJid!)
 							await sendReceipt(jid, undefined, [msg.key.id!], 'hist_sync')
@@ -535,44 +653,38 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
-	const flushBufferIfLastOfflineNode = (
+	/// processes a node with the given function
+	/// and adds the task to the existing buffer if we're buffering events
+	const processNodeWithBuffer = async(
 		node: BinaryNode,
 		identifier: string,
 		exec: (node: BinaryNode) => Promise<any>
 	) => {
-		const task = exec(node)
-			.catch(err => onUnexpectedError(err, identifier))
-		const offline = node.attrs.offline
-		if(offline) {
-			ev.processInBuffer(task)
+		ev.buffer()
+		await execTask()
+		ev.flush()
+
+		function execTask() {
+			return exec(node)
+				.catch(err => onUnexpectedError(err, identifier))
 		}
 	}
 
-	// called when all offline notifs are handled
-	ws.on('CB:ib,,offline', async(node: BinaryNode) => {
-		const child = getBinaryNodeChild(node, 'offline')
-		const offlineNotifs = +(child?.attrs.count || 0)
-
-		logger.info(`handled ${offlineNotifs} offline messages/notifications`)
-		await ev.flush()
-		ev.emit('connection.update', { receivedPendingNotifications: true })
-	})
-
 	// recv a message
 	ws.on('CB:message', (node: BinaryNode) => {
-		flushBufferIfLastOfflineNode(node, 'processing message', handleMessage)
+		processNodeWithBuffer(node, 'processing message', handleMessage)
 	})
 
 	ws.on('CB:call', async(node: BinaryNode) => {
-		flushBufferIfLastOfflineNode(node, 'handling call', handleCall)
+		processNodeWithBuffer(node, 'handling call', handleCall)
 	})
 
 	ws.on('CB:receipt', node => {
-		flushBufferIfLastOfflineNode(node, 'handling receipt', handleReceipt)
+		processNodeWithBuffer(node, 'handling receipt', handleReceipt)
 	})
 
 	ws.on('CB:notification', async(node: BinaryNode) => {
-		flushBufferIfLastOfflineNode(node, 'handling notification', handleNotification)
+		processNodeWithBuffer(node, 'handling notification', handleNotification)
 	})
 
 	ws.on('CB:ack,class:message', (node: BinaryNode) => {
@@ -616,6 +728,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	return {
 		...sock,
 		sendMessageAck,
-		sendRetryRequest
+		sendRetryRequest,
+		rejectCall
 	}
 }

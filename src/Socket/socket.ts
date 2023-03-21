@@ -27,10 +27,12 @@ export const makeSocket = ({
 	defaultQueryTimeoutMs,
 	syncFullHistory,
 	transactionOpts,
-	qrTimeout
+	qrTimeout,
+	options,
 }: SocketConfig) => {
 	const ws = new WebSocket(waWebSocketUrl, undefined, {
 		origin: DEFAULT_ORIGIN,
+		headers: options.headers,
 		handshakeTimeout: connectTimeoutMs,
 		timeout: connectTimeoutMs,
 		agent
@@ -396,7 +398,7 @@ export const makeSocket = ({
 	)
 
 	/** logout & invalidate connection */
-	const logout = async() => {
+	const logout = async(msg?: string) => {
 		const jid = authState.creds.me?.id
 		if(jid) {
 			await sendNode({
@@ -419,11 +421,18 @@ export const makeSocket = ({
 			})
 		}
 
-		end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }))
+		end(new Boom(msg || 'Intentional Logout', { statusCode: DisconnectReason.loggedOut }))
 	}
 
 	ws.on('message', onMessageRecieved)
-	ws.on('open', validateConnection)
+	ws.on('open', async() => {
+		try {
+			await validateConnection()
+		} catch(err) {
+			logger.error({ err }, 'error in validating connection')
+			end(err)
+		}
+	})
 	ws.on('error', error => end(
 		new Boom(
 			`WebSocket Error (${error.message})`,
@@ -523,17 +532,38 @@ export const makeSocket = ({
 		end(new Boom('Multi-device beta not joined', { statusCode: DisconnectReason.multideviceMismatch }))
 	})
 
+	let didStartBuffer = false
 	process.nextTick(() => {
-		// start buffering important events
-		ev.buffer()
+		if(creds.me?.id) {
+			// start buffering important events
+			// if we're logged in
+			ev.buffer()
+			didStartBuffer = true
+		}
+
 		ev.emit('connection.update', { connection: 'connecting', receivedPendingNotifications: false, qr: undefined })
 	})
+
+	// called when all offline notifs are handled
+	ws.on('CB:ib,,offline', (node: BinaryNode) => {
+		const child = getBinaryNodeChild(node, 'offline')
+		const offlineNotifs = +(child?.attrs.count || 0)
+
+		logger.info(`handled ${offlineNotifs} offline messages/notifications`)
+		if(didStartBuffer) {
+			ev.flush()
+			logger.trace('flushed events for initial buffer')
+		}
+
+		ev.emit('connection.update', { receivedPendingNotifications: true })
+	})
+
 	// update credentials when required
 	ev.on('creds.update', update => {
 		const name = update.me?.name
 		// if name has just been received
 		if(creds.me?.name !== name) {
-			logger.info({ name }, 'updated pushName')
+			logger.debug({ name }, 'updated pushName')
 			sendNode({
 				tag: 'presence',
 				attrs: { name: name! }
@@ -568,6 +598,7 @@ export const makeSocket = ({
 		end,
 		onUnexpectedError,
 		uploadPreKeys,
+		uploadPreKeysToServerIfRequired,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
 	}
