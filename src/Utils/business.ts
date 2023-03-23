@@ -96,6 +96,14 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 		})
 	}
 
+	if(typeof product.url !== 'undefined') {
+		content.push({
+			tag: 'url',
+			attrs: { },
+			content: Buffer.from(product.url)
+		})
+	}
+
 	if(typeof product.retailerId !== 'undefined') {
 		content.push({
 			tag: 'retailer_id',
