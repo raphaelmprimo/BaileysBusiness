@@ -196,7 +196,7 @@ export const parseProductNode = (productNode: BinaryNode) => {
 
 	const product: Product = {
 		id,
-		images: imagesNodes.map(parseImageUrls),
+		imagesUrls: Array.isArray(imagesNodes) ? imagesNodes.map(parseImageUrls) : [],
 		reviewStatus: {
 			whatsapp: getBinaryNodeChildString(statusInfoNode, 'status')!,
 		},
