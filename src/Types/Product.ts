@@ -47,7 +47,7 @@ export type ProductUpdate = Omit<ProductCreate, 'originCountryCode'>
 
 export type Product = ProductBase & {
 	id: string
-	imageUrls: { [_: string]: string }
+	images: [{ [_: string]: string }]
 	reviewStatus: { [_: string]: string }
 	availability: ProductAvailability
 }
