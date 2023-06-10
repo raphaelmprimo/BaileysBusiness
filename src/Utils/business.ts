@@ -156,7 +156,7 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 
 	if('originCountryCode' in product) {
 		if(typeof product.originCountryCode === 'undefined') {
-			attrs.compliance_category = 'COUNTRY_ORIGIN_EXEMPT'
+			attrs['compliance_category'] = 'COUNTRY_ORIGIN_EXEMPT'
 		} else {
 			content.push({
 				tag: 'compliance_info',
@@ -174,7 +174,7 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 
 
 	if(typeof product.isHidden !== 'undefined') {
-		attrs.is_hidden = product.isHidden.toString()
+		attrs['is_hidden'] = product.isHidden.toString()
 	}
 
 	const node: BinaryNode = {
